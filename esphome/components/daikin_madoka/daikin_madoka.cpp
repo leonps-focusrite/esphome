@@ -239,7 +239,8 @@ void DaikinMadoka::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t
       break;
     }
     case ESP_GATTC_NOTIFY_EVT: {
-      ESP_LOGVV(TAG, "GATT notify event, handle=%d, expected=%d, len=%d", param->notify.handle, this->notify_handle_, param->notify.value_len);
+      ESP_LOGVV(TAG, "GATT notify event, handle=%d, expected=%d, len=%d", param->notify.handle, this->notify_handle_,
+                param->notify.value_len);
       if (param->notify.handle != this->notify_handle_) {
         ESP_LOGW(TAG, "Different notify handle");
         break;
@@ -300,7 +301,8 @@ void DaikinMadoka::process_incoming_chunk_(std::vector<uint8_t> chk) {
   }
   this->pending_chunks_[chunk_id] = chk;
 
-  ESP_LOGVV(TAG, "pending_chunks_ size: %zu, highest chunk ID: %d", this->pending_chunks_.size(), this->pending_chunks_.rbegin()->first);
+  ESP_LOGVV(TAG, "pending_chunks_ size: %zu, highest chunk ID: %d", this->pending_chunks_.size(),
+            this->pending_chunks_.rbegin()->first);
   if (this->pending_chunks_.size() != this->pending_chunks_.rbegin()->first + 1) {
     ESP_LOGW(TAG, "Buffer is missing packets");
     return;
@@ -386,33 +388,65 @@ void DaikinMadoka::parse_cb_(std::vector<uint8_t> msg) {
   size_t i = 4;
   const size_t message_size = msg.size();
 
+  auto safe_next = [&](uint8_t &out) -> bool {
+    if (i >= message_size)
+      return false;
+    out = msg[i++];
+    return true;
+  };
+  auto safe_next_len = [&](uint8_t &out) -> bool {
+    if (i >= message_size)
+      return false;
+    out = msg[i++];
+    return true;
+  };
+  auto safe_val = [&](uint8_t len) -> std::vector<uint8_t> {
+    if (i + len > message_size)
+      return {};
+    std::vector<uint8_t> val(msg.begin() + i, msg.begin() + i + len);
+    i += len;
+    return val;
+  };
+
   switch (function_id) {
     case CMD_GET_SETTING_STATUS:
       ESP_LOGVV(TAG, "Parsing CMD_GET_SETTING_STATUS");
       while (i < message_size) {
-        uint8_t argument_id = msg[i++];
-        uint8_t len = msg[i++];
+        uint8_t argument_id, len;
+        if (!safe_next(argument_id) || !safe_next_len(len))
+          break;
         ESP_LOGVV(TAG, "Arg id: 0x%02X, len: %d", argument_id, len);
         if (argument_id == 0x20) {
-          std::vector<uint8_t> val(msg.begin() + i, msg.begin() + i + len);
+          auto val = safe_val(len);
+          if (val.empty()) {
+            ESP_LOGW(TAG, "CMD_GET_SETTING_STATUS: value out of bounds");
+            break;
+          }
           this->cur_status_.status = val[0];
           ESP_LOGD(TAG, "cur_status_.status = %d", this->cur_status_.status);
+        } else {
+          i += len;
         }
-        i += len;
       }
       break;
     case CMD_GET_OPERATION_MODE:
       ESP_LOGVV(TAG, "Parsing CMD_GET_OPERATION_MODE");
       while (i < message_size) {
-        uint8_t argument_id = msg[i++];
-        uint8_t len = msg[i++];
+        uint8_t argument_id, len;
+        if (!safe_next(argument_id) || !safe_next_len(len))
+          break;
         ESP_LOGVV(TAG, "Arg id: 0x%02X, len: %d", argument_id, len);
         if (argument_id == 0x20) {
-          std::vector<uint8_t> val(msg.begin() + i, msg.begin() + i + len);
+          auto val = safe_val(len);
+          if (val.empty()) {
+            ESP_LOGW(TAG, "CMD_GET_OPERATION_MODE: value out of bounds");
+            break;
+          }
           this->cur_status_.mode = val[0];
           ESP_LOGD(TAG, "cur_status_.mode = %d", this->cur_status_.mode);
+        } else {
+          i += len;
         }
-        i += len;
       }
       break;
     default:
@@ -454,40 +488,59 @@ void DaikinMadoka::parse_cb_(std::vector<uint8_t> msg) {
     case CMD_GET_SETPOINT:
       ESP_LOGVV(TAG, "Parsing CMD_GET_SETPOINT");
       while (i < message_size) {
-        uint8_t argument_id = msg[i++];
-        uint8_t len = msg[i++];
+        uint8_t argument_id, len;
+        if (!safe_next(argument_id) || !safe_next_len(len))
+          break;
         ESP_LOGVV(TAG, "Arg id: 0x%02X, len: %d", argument_id, len);
         switch (argument_id) {
           case 0x20: {
-            std::vector<uint8_t> val(msg.begin() + i, msg.begin() + i + len);
+            auto val = safe_val(len);
+            if (val.size() < 2) {
+              ESP_LOGW(TAG, "CMD_GET_SETPOINT: value out of bounds");
+              break;
+            }
             this->target_temperature_high = (float) (val[0] << 8 | val[1]) / 128;
             ESP_LOGD(TAG, "target_temperature_high = %.2f", this->target_temperature_high);
             break;
           }
           case 0x21: {
-            std::vector<uint8_t> val(msg.begin() + i, msg.begin() + i + len);
+            auto val = safe_val(len);
+            if (val.size() < 2) {
+              ESP_LOGW(TAG, "CMD_GET_SETPOINT: value out of bounds");
+              break;
+            }
             this->target_temperature_low = (float) (val[0] << 8 | val[1]) / 128;
             ESP_LOGD(TAG, "target_temperature_low = %.2f", this->target_temperature_low);
             break;
           }
+          default:
+            i += len;
+            break;
         }
-        i += len;
       }
       break;
     case CMD_GET_FAN_SPEED: {
       ESP_LOGVV(TAG, "Parsing CMD_GET_FAN_SPEED");
       uint8_t fan_mode = 255;
       while (i < message_size) {
-        uint8_t argument_id = msg[i++];
-        uint8_t len = msg[i++];
+        uint8_t argument_id, len;
+        if (!safe_next(argument_id) || !safe_next_len(len))
+          break;
         ESP_LOGVV(TAG, "Arg id: 0x%02X, len: %d", argument_id, len);
         if (this->cur_status_.mode == 1) {
+          i += len;
         } else if ((argument_id == 0x21 && len == 1 && this->cur_status_.mode == 4) ||
                    (argument_id == 0x20 && len == 1 && this->cur_status_.mode != 4)) {
-          fan_mode = msg[i];
+          auto val = safe_val(len);
+          if (val.empty()) {
+            ESP_LOGW(TAG, "CMD_GET_FAN_SPEED: value out of bounds");
+            break;
+          }
+          fan_mode = val[0];
           ESP_LOGD(TAG, "fan_mode = %d", fan_mode);
+        } else {
+          i += len;
         }
-        i += len;
       }
       switch (fan_mode) {
         case 0:
@@ -517,15 +570,21 @@ void DaikinMadoka::parse_cb_(std::vector<uint8_t> msg) {
     case CMD_GET_SENSOR_INFORMATION:
       ESP_LOGVV(TAG, "Parsing CMD_GET_SENSOR_INFORMATION");
       while (i < message_size) {
-        uint8_t argument_id = msg[i++];
-        uint8_t len = msg[i++];
+        uint8_t argument_id, len;
+        if (!safe_next(argument_id) || !safe_next_len(len))
+          break;
         ESP_LOGVV(TAG, "Arg id: 0x%02X, len: %d", argument_id, len);
         if (argument_id == 0x40) {
-          std::vector<uint8_t> val(msg.begin() + i, msg.begin() + i + len);
+          auto val = safe_val(len);
+          if (val.empty()) {
+            ESP_LOGW(TAG, "CMD_GET_SENSOR_INFORMATION: value out of bounds");
+            break;
+          }
           this->current_temperature = val[0];
           ESP_LOGD(TAG, "current_temperature = %d", this->current_temperature);
+        } else {
+          i += len;
         }
-        i += len;
       }
       break;
     default:

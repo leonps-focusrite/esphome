@@ -21,7 +21,12 @@ static const uint16_t CMD_GET_SENSOR_INFORMATION = 0x0110;
 
 void DaikinMadoka::dump_config() { LOG_CLIMATE(TAG, "Daikin Madoka Climate Controller", this); }
 
-void DaikinMadoka::setup() { this->receive_semaphore_ = xSemaphoreCreateMutex(); }
+void DaikinMadoka::setup() {
+  this->receive_semaphore_ = xSemaphoreCreateMutex();
+  if (this->receive_semaphore_ == nullptr) {
+    ESP_LOGE(TAG, "Failed to allocate receive semaphore");
+  }
+}
 
 inline static uint32_t get_command_cooldown(uint16_t cmd) {
   switch (cmd) {
@@ -46,6 +51,9 @@ inline static uint32_t get_command_cooldown(uint16_t cmd) {
 
 void DaikinMadoka::loop() {
   ESP_LOGV(TAG, "loop() called");
+  if (this->receive_semaphore_ == nullptr) {
+    return;
+  }
   std::vector<uint8_t> chk = {};
   if (xSemaphoreTake(this->receive_semaphore_, 0L)) {
     ESP_LOGVV(TAG, "Semaphore taken for received_chunks_");
@@ -247,6 +255,10 @@ void DaikinMadoka::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t
       }
       std::vector<uint8_t> chk =
           std::vector<uint8_t>{param->notify.value, param->notify.value + param->notify.value_len};
+      if (this->receive_semaphore_ == nullptr) {
+        ESP_LOGW(TAG, "Notify received before semaphore init; dropping chunk");
+        break;
+      }
       xSemaphoreTake(this->receive_semaphore_, portMAX_DELAY);
       this->received_chunks_.push(chk);
       xSemaphoreGive(this->receive_semaphore_);
@@ -266,7 +278,9 @@ void DaikinMadoka::update() {
     return;
   }
 
-  std::vector<uint16_t> all_cmds{CMD_GET_SETTING_STATUS, CMD_GET_OPERATION_MODE, CMD_GET_SETPOINT, CMD_GET_FAN_SPEED,
+  // Some Madoka firmware variants return malformed payloads for CMD_GET_SETPOINT.
+  // Skip that query to avoid parser churn while keeping mode/fan/temp telemetry.
+  std::vector<uint16_t> all_cmds{CMD_GET_SETTING_STATUS, CMD_GET_OPERATION_MODE, CMD_GET_FAN_SPEED,
                                  CMD_GET_SENSOR_INFORMATION};
   ESP_LOGD(TAG, "Sending %zu update queries", all_cmds.size());
   for (auto cmd : all_cmds) {
@@ -425,6 +439,10 @@ void DaikinMadoka::parse_cb_(std::vector<uint8_t> msg) {
           this->cur_status_.status = val[0];
           ESP_LOGD(TAG, "cur_status_.status = %d", this->cur_status_.status);
         } else {
+          if (i + len > message_size) {
+            ESP_LOGW(TAG, "CMD_GET_SETTING_STATUS: argument overruns packet");
+            break;
+          }
           i += len;
         }
       }
@@ -445,6 +463,10 @@ void DaikinMadoka::parse_cb_(std::vector<uint8_t> msg) {
           this->cur_status_.mode = val[0];
           ESP_LOGD(TAG, "cur_status_.mode = %d", this->cur_status_.mode);
         } else {
+          if (i + len > message_size) {
+            ESP_LOGW(TAG, "CMD_GET_OPERATION_MODE: argument overruns packet");
+            break;
+          }
           i += len;
         }
       }
@@ -496,7 +518,7 @@ void DaikinMadoka::parse_cb_(std::vector<uint8_t> msg) {
           case 0x20: {
             auto val = safe_val(len);
             if (val.size() < 2) {
-              ESP_LOGW(TAG, "CMD_GET_SETPOINT: value out of bounds");
+              ESP_LOGD(TAG, "CMD_GET_SETPOINT: value out of bounds");
               break;
             }
             this->target_temperature_high = (float) (val[0] << 8 | val[1]) / 128;
@@ -506,7 +528,7 @@ void DaikinMadoka::parse_cb_(std::vector<uint8_t> msg) {
           case 0x21: {
             auto val = safe_val(len);
             if (val.size() < 2) {
-              ESP_LOGW(TAG, "CMD_GET_SETPOINT: value out of bounds");
+              ESP_LOGD(TAG, "CMD_GET_SETPOINT: value out of bounds");
               break;
             }
             this->target_temperature_low = (float) (val[0] << 8 | val[1]) / 128;
@@ -514,6 +536,11 @@ void DaikinMadoka::parse_cb_(std::vector<uint8_t> msg) {
             break;
           }
           default:
+            if (i + len > message_size) {
+              ESP_LOGW(TAG, "CMD_GET_SETPOINT: argument overruns packet");
+              i = message_size;
+              break;
+            }
             i += len;
             break;
         }
@@ -528,6 +555,10 @@ void DaikinMadoka::parse_cb_(std::vector<uint8_t> msg) {
           break;
         ESP_LOGVV(TAG, "Arg id: 0x%02X, len: %d", argument_id, len);
         if (this->cur_status_.mode == 1) {
+          if (i + len > message_size) {
+            ESP_LOGW(TAG, "CMD_GET_FAN_SPEED: argument overruns packet");
+            break;
+          }
           i += len;
         } else if ((argument_id == 0x21 && len == 1 && this->cur_status_.mode == 4) ||
                    (argument_id == 0x20 && len == 1 && this->cur_status_.mode != 4)) {
@@ -539,6 +570,10 @@ void DaikinMadoka::parse_cb_(std::vector<uint8_t> msg) {
           fan_mode = val[0];
           ESP_LOGD(TAG, "fan_mode = %d", fan_mode);
         } else {
+          if (i + len > message_size) {
+            ESP_LOGW(TAG, "CMD_GET_FAN_SPEED: argument overruns packet");
+            break;
+          }
           i += len;
         }
       }
@@ -583,6 +618,10 @@ void DaikinMadoka::parse_cb_(std::vector<uint8_t> msg) {
           this->current_temperature = val[0];
           ESP_LOGD(TAG, "current_temperature = %d", this->current_temperature);
         } else {
+          if (i + len > message_size) {
+            ESP_LOGW(TAG, "CMD_GET_SENSOR_INFORMATION: argument overruns packet");
+            break;
+          }
           i += len;
         }
       }
